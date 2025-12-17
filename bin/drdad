@@ -1,0 +1,686 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# drdad - Daily Report of Developer Activity Data
+# Git productivity tracking with AI-powered summaries
+#
+# Usage: drdad [options]
+#
+# Examples:
+#   drdad                           # Today's report (current repo)
+#   drdad --repo ~/Projects/myapp   # Today's report for specific repo
+#   drdad --date 2024-12-01         # Specific date
+#   drdad --from 2024-01-01 --to 2024-12-31  # Date range with AI
+#   drdad --from 2024-01-01 --to 2024-12-31 --no-ai  # Skip AI (fast)
+#   drdad --from 2024-01-01 --to 2024-12-31 --throttle 500  # Slower API pace
+#   drdad --weekly 2024-W50         # Weekly aggregate
+#   drdad --monthly 2024-12         # Monthly aggregate
+#
+# Options:
+#   -r, --repo PATH      Path to git repository (default: current directory)
+#   -d, --date DATE      Generate report for specific date (YYYY-MM-DD)
+#   -f, --from DATE      Start date for range (YYYY-MM-DD)
+#   -t, --to DATE        End date for range (YYYY-MM-DD)
+#   -w, --weekly WEEK    Generate weekly report (YYYY-Www)
+#   -m, --monthly MONTH  Generate monthly report (YYYY-MM)
+#   --throttle MS        Delay between AI calls in ms (default: 200)
+#   --no-ai              Skip AI summary generation
+#   -v, --verbose        Show verbose output
+#   --version            Show version
+#   -h, --help           Show help
+#
+# Environment:
+#   ANTHROPIC_API_KEY    Required for AI summaries (Claude Haiku)
+#
+# Output:
+#   Reports are written to <repo>/.claude/reports/daily.jsonl
+
+require 'json'
+require 'date'
+require 'time'
+require 'optparse'
+require 'fileutils'
+require 'open3'
+require 'set'
+
+class DevReport
+  VERSION = '1.0.0'
+
+  COMMIT_TYPE_PATTERNS = {
+    # [#123] feat: description or feat(scope): description
+    /\[#\d+\]\s*(feat|feature)[:\(]/i => 'feat',
+    /\[#\d+\]\s*(fix|bugfix)[:\(]/i => 'fix',
+    /\[#\d+\]\s*(refactor)[:\(]/i => 'refactor',
+    /\[#\d+\]\s*(docs?|documentation)[:\(]/i => 'docs',
+    /\[#\d+\]\s*(test|tests|spec)[:\(]/i => 'test',
+    /\[#\d+\]\s*(chore)[:\(]/i => 'chore',
+    /\[#\d+\]\s*(perf|performance)[:\(]/i => 'perf',
+    /\[#\d+\]\s*(style)[:\(]/i => 'style',
+    /\[#\d+\]\s*(ci|build)[:\(]/i => 'ci',
+    # Conventional commits without issue ref
+    /^(feat|feature)[:\(]/i => 'feat',
+    /^(fix|bugfix)[:\(]/i => 'fix',
+    /^(refactor)[:\(]/i => 'refactor',
+    /^(docs?|documentation)[:\(]/i => 'docs',
+    /^(test|tests|spec)[:\(]/i => 'test',
+    /^(chore)[:\(]/i => 'chore',
+    /^(perf|performance)[:\(]/i => 'perf',
+    /^(style)[:\(]/i => 'style',
+    /^(ci|build)[:\(]/i => 'ci',
+  }.freeze
+
+  WORK_CATEGORIES = {
+    'feat' => 'feature',
+    'fix' => 'bugfix',
+    'refactor' => 'tech_debt',
+    'docs' => 'docs',
+    'test' => 'test',
+    'chore' => 'tech_debt',
+    'perf' => 'tech_debt',
+    'style' => 'tech_debt',
+    'ci' => 'tech_debt',
+    'other' => 'feature'  # Default assumption
+  }.freeze
+
+  def initialize(options = {})
+    @options = options
+    @repo_root = if options[:repo]
+      path = File.expand_path(options[:repo])
+      unless Dir.exist?(File.join(path, '.git')) || Dir.exist?(path) && `git -C #{path} rev-parse --git-dir 2>/dev/null`.strip != ''
+        abort "Error: #{path} is not a git repository"
+      end
+      path
+    else
+      find_repo_root
+    end
+    @repo_name = File.basename(@repo_root)
+    @reports_dir = File.join(@repo_root, '.claude', 'reports')
+    FileUtils.mkdir_p(@reports_dir)
+  end
+
+  def run
+    if @options[:weekly]
+      generate_weekly(@options[:weekly])
+    elsif @options[:monthly]
+      generate_monthly(@options[:monthly])
+    elsif @options[:from] && @options[:to]
+      generate_date_range(@options[:from], @options[:to])
+    else
+      date = @options[:date] || Date.today.to_s
+      generate_daily(date)
+    end
+  end
+
+  private
+
+  def find_repo_root
+    root = `git rev-parse --show-toplevel 2>/dev/null`.strip
+    abort "Error: Not in a git repository" if root.empty?
+    root
+  end
+
+  def generate_daily(date_str, quiet: false)
+    date = Date.parse(date_str)
+    puts "Generating report for #{date} in #{@repo_name}..." unless quiet
+
+    start_time = Time.now
+
+    # Phase 1: Git metrics
+    metrics = collect_git_metrics(date)
+
+    if metrics[:commits] == 0
+      puts "  No commits found for #{date}" unless quiet
+      return nil
+    end
+
+    # Phase 2: Derived metrics
+    qualitative = derive_qualitative_metrics(metrics)
+
+    # Phase 3: Optional tool augmentation
+    augment_with_tools(date, metrics) if tool_available?
+
+    # Phase 4: AI summary (unless --no-ai)
+    ai_elapsed = 0
+    if !@options[:no_ai] && metrics[:commits] > 0
+      ai_start = Time.now
+      qualitative[:ai_summary] = generate_ai_summary(date, metrics, qualitative)
+      ai_elapsed = (Time.now - ai_start).round(2)
+
+      # Throttle between AI calls (default 200ms)
+      throttle_ms = @options.fetch(:throttle, 200)
+      sleep(throttle_ms / 1000.0) if throttle_ms > 0
+    end
+
+    elapsed = (Time.now - start_time).round(2)
+
+    # Build record
+    record = {
+      date: date.to_s,
+      generated_at: Time.now.utc.iso8601,
+      repo: @repo_name,
+      timing: {
+        total_seconds: elapsed,
+        ai_seconds: ai_elapsed
+      },
+      quantitative: {
+        commits: metrics[:commits],
+        by_type: metrics[:by_type],
+        lines_added: metrics[:lines_added],
+        lines_removed: metrics[:lines_removed],
+        files_changed: metrics[:files_changed],
+        issues_referenced: metrics[:issues].to_a.sort,
+        prs_merged: metrics[:prs_merged] || 0
+      },
+      qualitative: qualitative
+    }
+
+    # Phase 5: Write JSONL
+    write_daily_record(record)
+
+    unless quiet
+      puts "  Done in #{elapsed}s: #{metrics[:commits]} commits, #{metrics[:lines_added]}+ #{metrics[:lines_removed]}- lines"
+      puts "  Focus: #{(qualitative[:focus_score] * 100).round}%, Theme: #{qualitative[:primary_theme]}"
+      puts "  Summary: #{qualitative[:ai_summary]}" if qualitative[:ai_summary]
+    end
+
+    record
+  end
+
+  def collect_git_metrics(date)
+    since = "#{date} 00:00:00"
+    til = "#{date} 23:59:59"
+
+    # Get commits with stats
+    log_output = `git -C "#{@repo_root}" log --since="#{since}" --until="#{til}" --format="COMMIT:%h|%s" --numstat 2>/dev/null`
+
+    commits = []
+    current_commit = nil
+    lines_added = 0
+    lines_removed = 0
+    files = Set.new
+    issues = Set.new
+    by_type = Hash.new(0)
+
+    log_output.each_line do |line|
+      line = line.strip
+      if line.start_with?('COMMIT:')
+        # Save previous commit
+        commits << current_commit if current_commit
+
+        # Parse new commit
+        parts = line.sub('COMMIT:', '').split('|', 2)
+        hash = parts[0]
+        message = parts[1] || ''
+
+        # Extract issue references
+        message.scan(/\[#(\d+)\]/).flatten.each { |i| issues << i }
+        message.scan(/#(\d+)/).flatten.each { |i| issues << i }
+
+        # Determine commit type
+        commit_type = classify_commit(message)
+        by_type[commit_type] += 1
+
+        current_commit = { hash: hash, message: message, type: commit_type }
+      elsif line =~ /^(\d+)\t(\d+)\t(.+)$/
+        # numstat line: added, removed, filename
+        added = $1.to_i
+        removed = $2.to_i
+        filename = $3
+
+        lines_added += added
+        lines_removed += removed
+        files << filename
+      end
+    end
+    commits << current_commit if current_commit
+
+    {
+      commits: commits.size,
+      commit_messages: commits.map { |c| c[:message] },
+      by_type: by_type,
+      lines_added: lines_added,
+      lines_removed: lines_removed,
+      files_changed: files.size,
+      files: files.to_a,
+      issues: issues
+    }
+  end
+
+  def classify_commit(message)
+    COMMIT_TYPE_PATTERNS.each do |pattern, type|
+      return type if message =~ pattern
+    end
+
+    # Heuristic fallbacks
+    msg_lower = message.downcase
+    return 'fix' if msg_lower.include?('fix') || msg_lower.include?('bug')
+    return 'docs' if msg_lower.include?('readme') || msg_lower.include?('doc')
+    return 'test' if msg_lower.include?('test') || msg_lower.include?('spec')
+    return 'refactor' if msg_lower.include?('refactor') || msg_lower.include?('cleanup')
+    return 'chore' if msg_lower.include?('merge') || msg_lower.include?('bump')
+
+    'other'
+  end
+
+  def derive_qualitative_metrics(metrics)
+    # Focus score: 1 / unique_issues, normalized to 0-1
+    # Single issue = 1.0, many scattered issues = lower
+    issue_count = [metrics[:issues].size, 1].max
+    focus_score = [1.0 / Math.sqrt(issue_count), 1.0].min
+
+    # Primary theme: most referenced issue or most common type
+    primary_theme = if metrics[:issues].any?
+      # Could look up issue titles via gh, but for now just use issue number
+      "##{metrics[:issues].first}"
+    else
+      metrics[:by_type].max_by { |_, v| v }&.first || 'general'
+    end
+
+    # Work categories distribution
+    total = metrics[:commits].to_f
+    total = 1.0 if total == 0
+
+    categories = Hash.new(0.0)
+    metrics[:by_type].each do |type, count|
+      category = WORK_CATEGORIES[type] || 'feature'
+      categories[category] += count / total
+    end
+
+    # Ensure all categories exist
+    %w[feature bugfix tech_debt docs test].each { |c| categories[c] ||= 0.0 }
+
+    # Round to 2 decimals
+    categories.transform_values! { |v| v.round(2) }
+
+    # Complexity indicator based on lines changed
+    total_lines = metrics[:lines_added] + metrics[:lines_removed]
+    complexity = case total_lines
+                 when 0..50 then 'low'
+                 when 51..300 then 'medium'
+                 else 'high'
+                 end
+
+    {
+      focus_score: focus_score.round(2),
+      primary_theme: primary_theme,
+      work_categories: categories,
+      complexity: complexity,
+      ai_summary: nil
+    }
+  end
+
+  def tool_available?
+    # Check for optional tools
+    @git_quick_stats ||= system('which git-quick-stats > /dev/null 2>&1')
+    @gitinspector ||= system('which gitinspector > /dev/null 2>&1')
+    @git_quick_stats || @gitinspector
+  end
+
+  def augment_with_tools(date, metrics)
+    # Placeholder for optional tool augmentation
+    # Could add contributor stats, comment ratios, etc.
+  end
+
+  def generate_ai_summary(date, metrics, qualitative)
+    return nil if metrics[:commits] == 0
+
+    # Build context for AI
+    commits_summary = metrics[:commit_messages].first(20).join("\n- ")
+
+    prompt = <<~PROMPT
+      Summarize this day's git activity in 1-2 concise sentences.
+
+      Date: #{date}
+      Repository: #{@repo_name}
+      Commits: #{metrics[:commits]}
+      Lines: +#{metrics[:lines_added]} -#{metrics[:lines_removed]}
+      Files: #{metrics[:files_changed]}
+      Issues: #{metrics[:issues].to_a.join(', ')}
+      Work distribution: #{qualitative[:work_categories].inspect}
+
+      Recent commits:
+      - #{commits_summary}
+
+      Focus on: what was accomplished, main theme, notable patterns.
+      Be specific about features/fixes, not generic.
+    PROMPT
+
+    # Use Haiku API directly for consistent, fast summaries
+    try_haiku_api(prompt)
+  end
+
+  def try_haiku_api(prompt)
+    api_key = ENV['ANTHROPIC_API_KEY']
+    return nil unless api_key
+
+    begin
+      require 'net/http'
+      require 'uri'
+
+      uri = URI.parse('https://api.anthropic.com/v1/messages')
+      http = Net::HTTP.new(uri.host, uri.port)
+      http.use_ssl = true
+      http.read_timeout = 30
+
+      request = Net::HTTP::Post.new(uri.path)
+      request['Content-Type'] = 'application/json'
+      request['x-api-key'] = api_key
+      request['anthropic-version'] = '2023-06-01'
+
+      request.body = {
+        model: 'claude-3-haiku-20240307',
+        max_tokens: 150,
+        messages: [{ role: 'user', content: prompt }]
+      }.to_json
+
+      response = http.request(request)
+
+      if response.code == '200'
+        data = JSON.parse(response.body)
+        return data.dig('content', 0, 'text')&.strip
+      end
+    rescue => e
+      warn "  Haiku API failed: #{e.message}" if @options[:verbose]
+    end
+
+    nil
+  end
+
+  def write_daily_record(record)
+    daily_file = File.join(@reports_dir, 'daily.jsonl')
+
+    # Read existing records, filter out this date (idempotent)
+    existing = []
+    if File.exist?(daily_file)
+      File.readlines(daily_file).each do |line|
+        begin
+          parsed = JSON.parse(line.strip)
+          existing << parsed unless parsed['date'] == record[:date]
+        rescue JSON::ParserError
+          # Skip malformed lines
+        end
+      end
+    end
+
+    # Append new record and write
+    existing << stringify_keys(record)
+    existing.sort_by! { |r| r['date'] }
+
+    File.open(daily_file, 'w') do |f|
+      existing.each { |r| f.puts(JSON.generate(r)) }
+    end
+  end
+
+  def stringify_keys(obj)
+    case obj
+    when Hash
+      obj.transform_keys(&:to_s).transform_values { |v| stringify_keys(v) }
+    when Array
+      obj.map { |v| stringify_keys(v) }
+    else
+      obj
+    end
+  end
+
+  def generate_date_range(from_str, to_str)
+    from_date = Date.parse(from_str)
+    to_date = Date.parse(to_str)
+
+    total_days = (to_date - from_date).to_i + 1
+    puts "Processing #{total_days} days from #{from_date} to #{to_date} in #{@repo_name}..."
+
+    processed = 0
+    skipped = 0
+    total_commits = 0
+
+    (from_date..to_date).each_with_index do |date, idx|
+      print "\r  [#{idx + 1}/#{total_days}] #{date}..."
+      $stdout.flush
+
+      result = generate_daily(date.to_s, quiet: true)
+      if result
+        processed += 1
+        total_commits += result[:quantitative][:commits]
+      else
+        skipped += 1
+      end
+    end
+
+    puts "\n  Done: #{processed} days, #{total_commits} commits, #{skipped} skipped"
+  end
+
+  def generate_weekly(week_str)
+    # Parse week string like "2024-W50"
+    unless week_str =~ /^(\d{4})-W(\d{1,2})$/
+      abort "Invalid week format. Use YYYY-Www (e.g., 2024-W50)"
+    end
+
+    year = $1.to_i
+    week = $2.to_i
+
+    # Calculate date range for this ISO week
+    jan4 = Date.new(year, 1, 4)
+    first_monday = jan4 - (jan4.cwday - 1)
+    week_start = first_monday + ((week - 1) * 7)
+    week_end = week_start + 6
+
+    puts "Generating weekly report for #{week_str} (#{week_start} to #{week_end})..."
+
+    daily_file = File.join(@reports_dir, 'daily.jsonl')
+    unless File.exist?(daily_file)
+      abort "No daily.jsonl found. Generate daily reports first."
+    end
+
+    # Collect daily records for this week
+    records = []
+    File.readlines(daily_file).each do |line|
+      begin
+        record = JSON.parse(line.strip)
+        date = Date.parse(record['date'])
+        if date >= week_start && date <= week_end
+          records << record
+        end
+      rescue
+        next
+      end
+    end
+
+    if records.empty?
+      puts "No daily records found for #{week_str}"
+      return
+    end
+
+    # Aggregate
+    weekly = aggregate_records(records, week_str, 'week')
+
+    # Write
+    weekly_file = File.join(@reports_dir, 'weekly.jsonl')
+    write_aggregate_record(weekly_file, weekly, 'week', week_str)
+
+    puts "Weekly report written: #{records.size} days, #{weekly['quantitative']['commits']} commits"
+  end
+
+  def generate_monthly(month_str)
+    unless month_str =~ /^(\d{4})-(\d{2})$/
+      abort "Invalid month format. Use YYYY-MM (e.g., 2024-12)"
+    end
+
+    year = $1.to_i
+    month = $2.to_i
+
+    month_start = Date.new(year, month, 1)
+    month_end = Date.new(year, month, -1)
+
+    puts "Generating monthly report for #{month_str}..."
+
+    daily_file = File.join(@reports_dir, 'daily.jsonl')
+    unless File.exist?(daily_file)
+      abort "No daily.jsonl found. Generate daily reports first."
+    end
+
+    # Collect daily records for this month
+    records = []
+    File.readlines(daily_file).each do |line|
+      begin
+        record = JSON.parse(line.strip)
+        date = Date.parse(record['date'])
+        if date >= month_start && date <= month_end
+          records << record
+        end
+      rescue
+        next
+      end
+    end
+
+    if records.empty?
+      puts "No daily records found for #{month_str}"
+      return
+    end
+
+    # Aggregate
+    monthly = aggregate_records(records, month_str, 'month')
+
+    # Write
+    monthly_file = File.join(@reports_dir, 'monthly.jsonl')
+    write_aggregate_record(monthly_file, monthly, 'month', month_str)
+
+    puts "Monthly report written: #{records.size} days, #{monthly['quantitative']['commits']} commits"
+  end
+
+  def aggregate_records(records, period_str, period_type)
+    # Sum quantitative metrics
+    commits = records.sum { |r| r.dig('quantitative', 'commits') || 0 }
+    lines_added = records.sum { |r| r.dig('quantitative', 'lines_added') || 0 }
+    lines_removed = records.sum { |r| r.dig('quantitative', 'lines_removed') || 0 }
+    files_changed = records.sum { |r| r.dig('quantitative', 'files_changed') || 0 }
+
+    # Aggregate by_type
+    by_type = Hash.new(0)
+    records.each do |r|
+      (r.dig('quantitative', 'by_type') || {}).each do |type, count|
+        by_type[type] += count
+      end
+    end
+
+    # Collect all issues
+    all_issues = records.flat_map { |r| r.dig('quantitative', 'issues_referenced') || [] }.uniq.sort
+
+    # Average focus score
+    focus_scores = records.map { |r| r.dig('qualitative', 'focus_score') }.compact
+    avg_focus = focus_scores.empty? ? 0 : (focus_scores.sum / focus_scores.size).round(2)
+
+    # Collect themes
+    themes = records.map { |r| r.dig('qualitative', 'primary_theme') }.compact.uniq
+
+    # Average work categories
+    categories = Hash.new { |h, k| h[k] = [] }
+    records.each do |r|
+      (r.dig('qualitative', 'work_categories') || {}).each do |cat, pct|
+        categories[cat] << pct
+      end
+    end
+    avg_categories = categories.transform_values do |values|
+      values.empty? ? 0.0 : (values.sum / values.size).round(2)
+    end
+
+    # Collect AI summaries for meta-summary
+    summaries = records.map { |r| r.dig('qualitative', 'ai_summary') }.compact
+
+    {
+      period_type => period_str,
+      'generated_at' => Time.now.utc.iso8601,
+      'repo' => @repo_name,
+      'days_counted' => records.size,
+      'quantitative' => {
+        'commits' => commits,
+        'by_type' => by_type,
+        'lines_added' => lines_added,
+        'lines_removed' => lines_removed,
+        'files_changed' => files_changed,
+        'issues_referenced' => all_issues
+      },
+      'qualitative' => {
+        'avg_focus_score' => avg_focus,
+        'themes' => themes,
+        'work_categories' => avg_categories,
+        'daily_summaries' => summaries
+      }
+    }
+  end
+
+  def write_aggregate_record(file_path, record, period_type, period_value)
+    existing = []
+    if File.exist?(file_path)
+      File.readlines(file_path).each do |line|
+        begin
+          parsed = JSON.parse(line.strip)
+          existing << parsed unless parsed[period_type] == period_value
+        rescue JSON::ParserError
+          next
+        end
+      end
+    end
+
+    existing << record
+    existing.sort_by! { |r| r[period_type] }
+
+    File.open(file_path, 'w') do |f|
+      existing.each { |r| f.puts(JSON.generate(r)) }
+    end
+  end
+end
+
+# Parse command line options
+options = {}
+OptionParser.new do |opts|
+  opts.banner = "Usage: dev-report [options]"
+
+  opts.on("-d", "--date DATE", "Generate report for specific date (YYYY-MM-DD)") do |d|
+    options[:date] = d
+  end
+
+  opts.on("-f", "--from DATE", "Start date for range (YYYY-MM-DD)") do |d|
+    options[:from] = d
+  end
+
+  opts.on("-t", "--to DATE", "End date for range (YYYY-MM-DD)") do |d|
+    options[:to] = d
+  end
+
+  opts.on("-w", "--weekly WEEK", "Generate weekly report (YYYY-Www)") do |w|
+    options[:weekly] = w
+  end
+
+  opts.on("-m", "--monthly MONTH", "Generate monthly report (YYYY-MM)") do |m|
+    options[:monthly] = m
+  end
+
+  opts.on("-r", "--repo PATH", "Path to git repository (default: current directory)") do |r|
+    options[:repo] = r
+  end
+
+  opts.on("--throttle MS", Integer, "Delay between AI calls in ms (default: 200)") do |ms|
+    options[:throttle] = ms
+  end
+
+  opts.on("--no-ai", "Skip AI summary generation") do
+    options[:no_ai] = true
+  end
+
+  opts.on("-v", "--verbose", "Show verbose output") do
+    options[:verbose] = true
+  end
+
+  opts.on("--version", "Show version") do
+    puts "dev-report #{DevReport::VERSION}"
+    exit
+  end
+
+  opts.on("-h", "--help", "Show this help") do
+    puts opts
+    exit
+  end
+end.parse!
+
+# Run
+DevReport.new(options).run
