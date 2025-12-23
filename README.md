@@ -97,6 +97,193 @@ Reports are written to `<repo>/.claude/reports/`:
 }
 ```
 
+## Automated Scheduling (macOS)
+
+Use launchd to run drdad automatically. Reports are generated silently and written to each repository's `.claude/reports/` directory.
+
+### Daily Reports
+
+Generate a report for yesterday's work every morning at 6 AM:
+
+First, create a wrapper script. This is necessary because launchd doesn't inherit your shell environment (PATH, API keys, locale) and can't compute relative dates like "yesterday":
+
+**`~/bin/drdad-yesterday`**
+```bash
+#!/bin/bash
+# drdad-yesterday - Wrapper for launchd to run drdad for yesterday's date
+#
+# Why this exists: launchd doesn't inherit shell environment (PATH, API keys,
+# locale) and can't compute dates. This wrapper sources ~/.zshenv, sets UTF-8
+# locale, and calculates yesterday's date for the daily report.
+
+set -e
+source ~/.zshenv
+export LANG=en_US.UTF-8
+export LC_ALL=en_US.UTF-8
+YESTERDAY=$(date -v-1d +%Y-%m-%d)
+/path/to/drdad/bin/drdad --repo "$1" --date "$YESTERDAY"
+```
+
+Make it executable: `chmod +x ~/bin/drdad-yesterday`
+
+**`~/Library/LaunchAgents/com.drdad.daily.plist`**
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.drdad.daily</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/you/bin/drdad-yesterday</string>
+        <string>/Users/you/Projects/myapp</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>6</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>/tmp/drdad-daily.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/drdad-daily.err</string>
+</dict>
+</plist>
+```
+
+### Weekly Reports
+
+Generate weekly aggregates every Monday at 7 AM:
+
+**`~/Library/LaunchAgents/com.drdad.weekly.plist`**
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.drdad.weekly</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/you/bin/drdad-weekly</string>
+        <string>/Users/you/Projects/myapp</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Weekday</key>
+        <integer>1</integer>
+        <key>Hour</key>
+        <integer>7</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>/tmp/drdad-weekly.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/drdad-weekly.err</string>
+</dict>
+</plist>
+```
+
+**`~/bin/drdad-weekly`**
+```bash
+#!/bin/bash
+# drdad-weekly - Wrapper for launchd to generate last week's aggregate report
+#
+# Calculates the ISO week number for 7 days ago and generates the weekly report.
+
+set -e
+source ~/.zshenv
+export LANG=en_US.UTF-8
+export LC_ALL=en_US.UTF-8
+LAST_WEEK=$(date -v-7d +%G-W%V)
+/path/to/drdad/bin/drdad --repo "$1" --weekly "$LAST_WEEK"
+```
+
+### Multiple Repositories
+
+Create a wrapper to process all your repos:
+
+**`~/bin/drdad-all-repos`**
+```bash
+#!/bin/bash
+# drdad-all-repos - Process multiple repositories in one run
+#
+# Usage: drdad-all-repos [DATE]
+# If DATE is omitted, defaults to yesterday.
+
+set -e
+source ~/.zshenv
+export LANG=en_US.UTF-8
+export LC_ALL=en_US.UTF-8
+
+REPOS=(
+    "/Users/you/Projects/app1"
+    "/Users/you/Projects/app2"
+    "/Users/you/Projects/app3"
+)
+
+DATE=${1:-$(date -v-1d +%Y-%m-%d)}
+
+for repo in "${REPOS[@]}"; do
+    echo "Processing $repo for $DATE..."
+    /path/to/drdad/bin/drdad --repo "$repo" --date "$DATE"
+done
+```
+
+### Managing Launch Agents
+
+```bash
+# Load (start) an agent
+launchctl load ~/Library/LaunchAgents/com.drdad.daily.plist
+
+# Unload (stop) an agent
+launchctl unload ~/Library/LaunchAgents/com.drdad.daily.plist
+
+# Run immediately (test)
+launchctl start com.drdad.daily
+
+# Check status
+launchctl list | grep drdad
+
+# View logs
+tail -f /tmp/drdad-daily.log
+```
+
+### Troubleshooting
+
+**Agent not running?**
+- Check logs: `cat /tmp/drdad-daily.err`
+- Verify paths are absolute (no `~`)
+- Ensure scripts are executable: `chmod +x ~/bin/drdad-*`
+- Check agent is loaded: `launchctl list | grep drdad`
+
+**Missing environment?**
+- launchd doesn't inherit your shell's PATH/environment
+- Wrapper scripts `source ~/.zshenv` to load `ANTHROPIC_API_KEY` and PATH
+- Alternatively, set environment variables explicitly in the plist
+
+**Encoding errors?**
+- `invalid byte sequence in US-ASCII` means locale isn't set
+- Add `export LANG=en_US.UTF-8` and `export LC_ALL=en_US.UTF-8` to wrapper scripts
+
+**API rate limits?**
+- Add `--throttle 500` for longer delays between AI calls
+- Use `--no-ai` for fast runs without summaries
+
 ## License
 
 MIT
