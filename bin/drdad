@@ -30,7 +30,7 @@
 #   -h, --help           Show help
 #
 # Environment:
-#   ANTHROPIC_API_KEY    Required for AI summaries (Claude Haiku)
+#   (none required - uses claude CLI for AI summaries)
 #
 # Output:
 #   Reports are written to <repo>/.claude/reports/daily.jsonl
@@ -345,44 +345,19 @@ class DevReport
       Be specific about features/fixes, not generic.
     PROMPT
 
-    # Use Haiku API directly for consistent, fast summaries
-    try_haiku_api(prompt)
+    # Use claude CLI for AI summaries
+    try_claude_cli(prompt)
   end
 
-  def try_haiku_api(prompt)
-    api_key = ENV['ANTHROPIC_API_KEY']
-    return nil unless api_key
+  def try_claude_cli(prompt)
+    # Throttle is less critical with local CLI vs API rate limits,
+    # but still useful for pacing output in batch operations.
+    stdout, status = Open3.capture2('claude', '-p', prompt)
+    return stdout.strip if status.success?
 
-    begin
-      require 'net/http'
-      require 'uri'
-
-      uri = URI.parse('https://api.anthropic.com/v1/messages')
-      http = Net::HTTP.new(uri.host, uri.port)
-      http.use_ssl = true
-      http.read_timeout = 30
-
-      request = Net::HTTP::Post.new(uri.path)
-      request['Content-Type'] = 'application/json'
-      request['x-api-key'] = api_key
-      request['anthropic-version'] = '2023-06-01'
-
-      request.body = {
-        model: 'claude-3-haiku-20240307',
-        max_tokens: 150,
-        messages: [{ role: 'user', content: prompt }]
-      }.to_json
-
-      response = http.request(request)
-
-      if response.code == '200'
-        data = JSON.parse(response.body)
-        return data.dig('content', 0, 'text')&.strip
-      end
-    rescue => e
-      warn "  Haiku API failed: #{e.message}" if @options[:verbose]
-    end
-
+    nil
+  rescue => e
+    warn "  claude CLI failed: #{e.message}" if @options[:verbose]
     nil
   end
 
@@ -446,7 +421,7 @@ class DevReport
       end
     end
 
-    puts "\n  Done: #{processed} days, #{total_commits} commits, #{skipped} skipped"
+    puts "\n  Done: #{total_commits} commits over #{processed} days (#{skipped} with no activity)"
   end
 
   def generate_weekly(week_str)

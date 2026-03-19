@@ -70,9 +70,7 @@ Look for:
 
 ## Environment
 
-```bash
-export ANTHROPIC_API_KEY="your-key"
-```
+AI summaries use the `claude -p` CLI (uses your existing Claude subscription). No API key needed.
 
 ## Testing Without AI
 
@@ -82,4 +80,4 @@ For rapid iteration on non-AI changes:
 drdad --repo /path/to/repo --from 2025-01-01 --to 2025-12-31 --no-ai
 ```
 
-This skips Haiku calls entirely (~0.1s/day vs ~2s/day).
+This skips claude CLI calls entirely (~0.1s/day vs ~2s/day).

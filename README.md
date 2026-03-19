@@ -2,7 +2,7 @@
 
 **Daily Report of Developer Activity Data**
 
-Git productivity tracking with AI-powered summaries using Claude Haiku.
+Git productivity tracking with AI-powered summaries via the `claude` CLI.
 
 ## Features
 
@@ -30,7 +30,7 @@ ln -s /path/to/drdad/bin/drdad /usr/local/bin/drdad
 
 - Ruby 3.0+
 - Git
-- `ANTHROPIC_API_KEY` environment variable (for AI summaries)
+- `claude` CLI installed and authenticated (for AI summaries)
 
 ## Usage
 
@@ -273,7 +273,7 @@ tail -f /tmp/drdad-daily.log
 
 **Missing environment?**
 - launchd doesn't inherit your shell's PATH/environment
-- Wrapper scripts `source ~/.zshenv` to load `ANTHROPIC_API_KEY` and PATH
+- Wrapper scripts `source ~/.zshenv` to load PATH (must include `claude` CLI)
 - Alternatively, set environment variables explicitly in the plist
 
 **Encoding errors?**

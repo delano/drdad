@@ -9,7 +9,7 @@ Gem::Specification.new do |spec|
   spec.email         = ['delano@onetimesecret.com']
 
   spec.summary       = 'Daily Report of Developer Activity Data'
-  spec.description   = 'Git productivity tracking with AI-powered summaries using Claude Haiku. Track daily commits, lines changed, and file modifications with AI-generated summaries of each day\'s work. Supports daily, weekly, and monthly aggregation with commit type classification and issue reference extraction.'
+  spec.description   = 'Git productivity tracking with AI-powered summaries via the claude CLI. Track daily commits, lines changed, and file modifications with AI-generated summaries of each day\'s work. Supports daily, weekly, and monthly aggregation with commit type classification and issue reference extraction.'
   spec.homepage      = 'https://github.com/delano/drdad'
   spec.license       = 'MIT'
   spec.required_ruby_version = '>= 3.0.0'
@@ -26,7 +26,6 @@ Gem::Specification.new do |spec|
   spec.executables   = ['drdad']
   spec.require_paths = ['lib']
 
-  # No runtime dependencies - uses only Ruby stdlib:
-  # - json, date, time, optparse, fileutils, open3, set
-  # - net/http, uri (for Anthropic API)
+  # Runtime dependencies
+  spec.add_dependency 'dry-cli', '~> 1.2'
 end
