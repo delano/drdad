@@ -42,6 +42,7 @@ require 'optparse'
 require 'fileutils'
 require 'open3'
 require 'set'
+require 'sqlite3'
 
 class DevReport
   VERSION = '1.0.0'
@@ -93,21 +94,79 @@ class DevReport
     else
       find_repo_root
     end
-    @repo_name = File.basename(@repo_root)
-    @reports_dir = File.join(@repo_root, '.claude', 'reports')
+    @repo_name = detect_repo_name
+    @reports_dir = if @options[:output_dir]
+      # Central reports directory: <output_dir>/<repo_name>/
+      File.join(File.expand_path(@options[:output_dir]), @repo_name)
+    else
+      # Default: <repo>/.claude/reports/
+      File.join(@repo_root, '.claude', 'reports')
+    end
     FileUtils.mkdir_p(@reports_dir)
   end
 
   def run
+    # Determine date range for logging
+    date_from, date_to = determine_date_range
+    run_info = log_run_start(date_from, date_to)
+
+    begin
+      result = if @options[:weekly]
+        generate_weekly(@options[:weekly])
+      elsif @options[:monthly]
+        generate_monthly(@options[:monthly])
+      elsif @options[:from] && @options[:to]
+        generate_date_range(@options[:from], @options[:to])
+      else
+        date = @options[:date] || Date.today.to_s
+        r = generate_daily(date)
+        { days_processed: 1, days_with_commits: r ? 1 : 0, total_commits: r ? r[:quantitative][:commits] : 0 }
+      end
+
+      log_run_end(run_info,
+        days_processed: result[:days_processed] || 0,
+        days_with_commits: result[:days_with_commits] || 0,
+        total_commits: result[:total_commits] || 0,
+        exit_status: 0
+      )
+    rescue => e
+      log_run_end(run_info,
+        days_processed: 0,
+        days_with_commits: 0,
+        total_commits: 0,
+        exit_status: 1,
+        error_message: e.message
+      )
+      raise
+    end
+  end
+
+  def determine_date_range
     if @options[:weekly]
-      generate_weekly(@options[:weekly])
+      # Parse week to date range
+      if @options[:weekly] =~ /^(\d{4})-W(\d{1,2})$/
+        year, week = $1.to_i, $2.to_i
+        jan4 = Date.new(year, 1, 4)
+        first_monday = jan4 - (jan4.cwday - 1)
+        week_start = first_monday + ((week - 1) * 7)
+        [week_start.to_s, (week_start + 6).to_s]
+      else
+        [@options[:weekly], @options[:weekly]]
+      end
     elsif @options[:monthly]
-      generate_monthly(@options[:monthly])
+      if @options[:monthly] =~ /^(\d{4})-(\d{2})$/
+        year, month = $1.to_i, $2.to_i
+        start_date = Date.new(year, month, 1)
+        end_date = Date.new(year, month, -1)
+        [start_date.to_s, end_date.to_s]
+      else
+        [@options[:monthly], @options[:monthly]]
+      end
     elsif @options[:from] && @options[:to]
-      generate_date_range(@options[:from], @options[:to])
+      [@options[:from], @options[:to]]
     else
       date = @options[:date] || Date.today.to_s
-      generate_daily(date)
+      [date, date]
     end
   end
 
@@ -117,6 +176,70 @@ class DevReport
     root = `git rev-parse --show-toplevel 2>/dev/null`.strip
     abort "Error: Not in a git repository" if root.empty?
     root
+  end
+
+  def detect_repo_name
+    # Extract project name from git remote origin URL
+    remote_url = `git -C "#{@repo_root}" remote get-url origin 2>/dev/null`.strip
+    if remote_url && !remote_url.empty?
+      # Handles SSH (git@github.com:user/repo.git) and HTTPS (https://github.com/user/repo.git)
+      remote_url.split('/').last.sub(/\.git$/, '')
+    else
+      # Fallback to folder name if no remote
+      File.basename(@repo_root)
+    end
+  end
+
+  # Run journal (SQLite) for tracking execution history
+  def runs_db_path
+    # Store in parent of reports dir (the output-dir or repo root)
+    parent = File.dirname(@reports_dir)
+    File.join(parent, 'runs.db')
+  end
+
+  def init_runs_db
+    db = SQLite3::Database.new(runs_db_path)
+    db.execute <<-SQL
+      CREATE TABLE IF NOT EXISTS runs (
+        id INTEGER PRIMARY KEY,
+        started_at TEXT NOT NULL,
+        finished_at TEXT,
+        repo TEXT NOT NULL,
+        date_from TEXT,
+        date_to TEXT,
+        days_processed INTEGER,
+        days_with_commits INTEGER,
+        total_commits INTEGER,
+        duration_seconds REAL,
+        exit_status INTEGER,
+        error_message TEXT
+      );
+    SQL
+    db.execute "CREATE INDEX IF NOT EXISTS idx_runs_repo ON runs(repo);"
+    db.execute "CREATE INDEX IF NOT EXISTS idx_runs_started ON runs(started_at);"
+    db
+  end
+
+  def log_run_start(date_from, date_to)
+    db = init_runs_db
+    started_at = Time.now.utc.iso8601
+    db.execute(
+      "INSERT INTO runs (started_at, repo, date_from, date_to) VALUES (?, ?, ?, ?)",
+      [started_at, @repo_name, date_from, date_to]
+    )
+    run_id = db.last_insert_row_id
+    db.close
+    { id: run_id, started_at: Time.now }
+  end
+
+  def log_run_end(run_info, days_processed:, days_with_commits:, total_commits:, exit_status: 0, error_message: nil)
+    db = init_runs_db
+    duration = Time.now - run_info[:started_at]
+    db.execute(
+      "UPDATE runs SET finished_at = ?, days_processed = ?, days_with_commits = ?, total_commits = ?, duration_seconds = ?, exit_status = ?, error_message = ? WHERE id = ?",
+      [Time.now.utc.iso8601, days_processed, days_with_commits, total_commits, duration.round(2), exit_status, error_message, run_info[:id]]
+    )
+    db.close
   end
 
   def generate_daily(date_str, quiet: false)
@@ -379,7 +502,7 @@ class DevReport
 
     # Append new record and write
     existing << stringify_keys(record)
-    existing.sort_by! { |r| r['date'] }
+    existing.sort_by! { |r| r['date'] || '' }
 
     File.open(daily_file, 'w') do |f|
       existing.each { |r| f.puts(JSON.generate(r)) }
@@ -422,6 +545,9 @@ class DevReport
     end
 
     puts "\n  Done: #{total_commits} commits over #{processed} days (#{skipped} with no activity)"
+
+    # Return metrics for run journal
+    { days_processed: total_days, days_with_commits: processed, total_commits: total_commits }
   end
 
   def generate_weekly(week_str)
@@ -462,7 +588,7 @@ class DevReport
 
     if records.empty?
       puts "No daily records found for #{week_str}"
-      return
+      return { days_processed: 7, days_with_commits: 0, total_commits: 0 }
     end
 
     # Aggregate
@@ -473,6 +599,8 @@ class DevReport
     write_aggregate_record(weekly_file, weekly, 'week', week_str)
 
     puts "Weekly report written: #{records.size} days, #{weekly['quantitative']['commits']} commits"
+
+    { days_processed: 7, days_with_commits: records.size, total_commits: weekly['quantitative']['commits'] }
   end
 
   def generate_monthly(month_str)
@@ -507,9 +635,11 @@ class DevReport
       end
     end
 
+    days_in_month = (month_end - month_start).to_i + 1
+
     if records.empty?
       puts "No daily records found for #{month_str}"
-      return
+      return { days_processed: days_in_month, days_with_commits: 0, total_commits: 0 }
     end
 
     # Aggregate
@@ -520,6 +650,8 @@ class DevReport
     write_aggregate_record(monthly_file, monthly, 'month', month_str)
 
     puts "Monthly report written: #{records.size} days, #{monthly['quantitative']['commits']} commits"
+
+    { days_processed: days_in_month, days_with_commits: records.size, total_commits: monthly['quantitative']['commits'] }
   end
 
   def aggregate_records(records, period_str, period_type)
@@ -632,6 +764,10 @@ OptionParser.new do |opts|
 
   opts.on("-r", "--repo PATH", "Path to git repository (default: current directory)") do |r|
     options[:repo] = r
+  end
+
+  opts.on("-o", "--output-dir PATH", "Central directory for reports (default: <repo>/.claude/reports)") do |o|
+    options[:output_dir] = o
   end
 
   opts.on("--throttle MS", Integer, "Delay between AI calls in ms (default: 200)") do |ms|
