@@ -33,7 +33,7 @@
 #   (none required - uses claude CLI for AI summaries)
 #
 # Output:
-#   Reports are written to <repo>/.claude/reports/daily.jsonl
+#   Reports are written to <repo>/.claude/reports/<date>.json
 
 require 'json'
 require 'date'
@@ -484,29 +484,26 @@ class DevReport
     nil
   end
 
-  def write_daily_record(record)
-    daily_file = File.join(@reports_dir, 'daily.jsonl')
+  def load_daily_records_for_range(from_date, to_date)
+    records = []
+    (from_date..to_date).each do |date|
+      file_path = File.join(@reports_dir, "#{date}.json")
+      next unless File.exist?(file_path)
 
-    # Read existing records, filter out this date (idempotent)
-    existing = []
-    if File.exist?(daily_file)
-      File.readlines(daily_file).each do |line|
-        begin
-          parsed = JSON.parse(line.strip)
-          existing << parsed unless parsed['date'] == record[:date]
-        rescue JSON::ParserError
-          # Skip malformed lines
-        end
+      begin
+        record = JSON.parse(File.read(file_path))
+        records << record
+      rescue JSON::ParserError
+        warn "  Skipping malformed file: #{file_path}"
       end
     end
+    records
+  end
 
-    # Append new record and write
-    existing << stringify_keys(record)
-    existing.sort_by! { |r| r['date'] || '' }
-
-    File.open(daily_file, 'w') do |f|
-      existing.each { |r| f.puts(JSON.generate(r)) }
-    end
+  def write_daily_record(record)
+    # Write individual JSON file per day (e.g., 2025-03-27.json)
+    daily_file = File.join(@reports_dir, "#{record[:date]}.json")
+    File.write(daily_file, JSON.pretty_generate(stringify_keys(record)))
   end
 
   def stringify_keys(obj)
@@ -567,24 +564,8 @@ class DevReport
 
     puts "Generating weekly report for #{week_str} (#{week_start} to #{week_end})..."
 
-    daily_file = File.join(@reports_dir, 'daily.jsonl')
-    unless File.exist?(daily_file)
-      abort "No daily.jsonl found. Generate daily reports first."
-    end
-
-    # Collect daily records for this week
-    records = []
-    File.readlines(daily_file).each do |line|
-      begin
-        record = JSON.parse(line.strip)
-        date = Date.parse(record['date'])
-        if date >= week_start && date <= week_end
-          records << record
-        end
-      rescue
-        next
-      end
-    end
+    # Collect daily records from individual JSON files
+    records = load_daily_records_for_range(week_start, week_end)
 
     if records.empty?
       puts "No daily records found for #{week_str}"
@@ -616,24 +597,8 @@ class DevReport
 
     puts "Generating monthly report for #{month_str}..."
 
-    daily_file = File.join(@reports_dir, 'daily.jsonl')
-    unless File.exist?(daily_file)
-      abort "No daily.jsonl found. Generate daily reports first."
-    end
-
-    # Collect daily records for this month
-    records = []
-    File.readlines(daily_file).each do |line|
-      begin
-        record = JSON.parse(line.strip)
-        date = Date.parse(record['date'])
-        if date >= month_start && date <= month_end
-          records << record
-        end
-      rescue
-        next
-      end
-    end
+    # Collect daily records from individual JSON files
+    records = load_daily_records_for_range(month_start, month_end)
 
     days_in_month = (month_end - month_start).to_i + 1
 

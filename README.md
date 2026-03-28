@@ -11,7 +11,7 @@ Git productivity tracking with AI-powered summaries via the `claude` CLI.
 - Aggregate weekly and monthly reports
 - Issue reference extraction
 - Commit type classification (feat, fix, docs, test, refactor, etc.)
-- JSONL output for easy analysis
+- Individual JSON files per day for clean, clobber-free storage
 
 ## Installation
 
@@ -62,8 +62,8 @@ drdad --monthly 2024-12
 
 ## Output
 
-Reports are written to `<repo>/.claude/reports/`:
-- `daily.jsonl` - One JSON object per day
+Reports are written to `<repo>/.claude/reports/` (or `--output-dir/<repo>/`):
+- `<date>.json` - Individual JSON file per day (e.g., `2025-03-27.json`)
 - `weekly.jsonl` - Weekly aggregates
 - `monthly.jsonl` - Monthly aggregates
 
@@ -283,6 +283,61 @@ tail -f /tmp/drdad-daily.log
 **API rate limits?**
 - Add `--throttle 500` for longer delays between AI calls
 - Use `--no-ai` for fast runs without summaries
+
+## Architecture
+
+### Key Files
+
+| File | Role |
+|------|------|
+| `bin/drdad` | Main Ruby binary (738 lines, self-contained) |
+| `~/.config/launchd/com.drdad.daily.plist` | launchd schedule — 9 AM daily |
+| `~/.config/launchd/drdad-yesterday` | Wrapper: sources shell env, computes yesterday's date |
+| `~/Library/CloudStorage/.../Reports/drdad/` | Central reports directory (ProtonDrive synced) |
+| `.../<repo>/<date>.json` | Individual daily reports (e.g., `2025-03-27.json`) |
+| `~/Projects/_/drdad/runs.db` | SQLite execution log (shared across all repos) |
+| `~/.claude/logs/drdad.{log,err}` | stdout/stderr from launchd runs |
+
+### Execution Flow
+
+```
+launchd (9 AM)
+    │
+    ▼
+drdad-yesterday (wrapper)
+    ├── sources ~/.zshenv (gets PATH, ruby, claude)
+    ├── computes YESTERDAY=$(date -v-1d +%Y-%m-%d)
+    │
+    ▼
+bin/drdad --repo <path> --output-dir <reports-dir> --date $YESTERDAY
+    │
+    ├── 1. Git metrics: git log --numstat → commits, lines, files
+    ├── 2. Qualitative: focus score, work categories, complexity
+    ├── 3. AI summary: claude -p "<prompt>" → natural language summary
+    │
+    ▼
+Output:
+    <reports-dir>/<repo>/<date>.json   (individual file per day)
+    <reports-dir>/runs.db              (execution log)
+```
+
+### Dependencies
+
+- **Internal**: Git history from the target repository
+- **External**:
+  - `claude` CLI (for AI summaries via `claude -p`)
+  - `git` (for log/remote queries)
+  - macOS `date -v` (for date arithmetic in wrapper)
+
+### Observations
+
+- **launchd vs cron**: macOS launchd handles sleep/wake transitions gracefully — if the machine is asleep at 9 AM, the job runs when it wakes. Cron would skip it entirely.
+
+- **Wrapper script pattern**: launchd runs in a minimal environment without shell profile. The `drdad-yesterday` wrapper solves this by sourcing `~/.zshenv` before invoking Ruby — a common pattern for scheduled tasks that need PATH, Ruby, or other shell-configured tools.
+
+- **Individual JSON files**: Each day gets its own file (`2025-03-27.json`), eliminating clobber issues from the previous JSONL approach. Files are pretty-printed for readability and can be individually edited or deleted without affecting other days.
+
+- **Unintegrated refactor**: `lib/drdad/cli.rb` and `lib/drdad/repository.rb` exist as scaffolding for a future `dry-cli` multi-command structure, but aren't used — the binary is entirely self-contained.
 
 ## License
 

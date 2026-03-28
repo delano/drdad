@@ -8,7 +8,7 @@ When making changes to drdad, follow this graduated testing approach to catch is
 
 Test changes by processing real git history in expanding batches. Each iteration:
 1. **Run** - Process a date range
-2. **Check** - Verify JSONL output and AI summaries
+2. **Check** - Verify JSON output and AI summaries
 3. **Adjust** - Fix any bugs discovered
 4. **Commit** - Document what worked and what was fixed
 5. **Expand** - Move to larger batch
@@ -34,15 +34,15 @@ drdad --repo /path/to/repo --date 2025-12-15
 # Iteration 2+: Date ranges
 drdad --repo /path/to/repo --from 2025-12-13 --to 2025-12-14
 
-# Verify output
-cat /path/to/repo/.claude/reports/daily.jsonl | jq -c '{date, commits: .quantitative.commits, ai: .qualitative.ai_summary[:60]}'
+# Verify output (individual JSON files per day)
+cat /path/to/repo/.claude/reports/2025-12-15.json | jq '{date, commits: .quantitative.commits, ai: .qualitative.ai_summary[:60]}'
 ```
 
 ### Verification Checklist
 
 After each iteration, verify:
 
-- [ ] JSONL records are well-formed (parse with `jq`)
+- [ ] JSON files are well-formed (parse with `jq`)
 - [ ] `repo` field present in each record
 - [ ] `timing.total_seconds` and `timing.ai_seconds` populated
 - [ ] AI summaries are coherent and specific (not generic)
@@ -54,12 +54,13 @@ After each iteration, verify:
 After completing iterations, run aggregate analysis:
 
 ```bash
-cat daily.jsonl | jq -s '{
+# Aggregate all daily JSON files
+jq -s '{
   total_records: length,
   missing_ai: [.[] | select(.qualitative.ai_summary == null)] | length,
   commit_types: [.[].quantitative.by_type | to_entries[]] | group_by(.key) | map({(.[0].key): ([.[].value] | add)}) | add,
   avg_timing: ([.[].timing.total_seconds] | add / length)
-}'
+}' /path/to/reports/*.json
 ```
 
 Look for:
