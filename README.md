@@ -290,7 +290,8 @@ tail -f /tmp/drdad-daily.log
 
 | File | Role |
 |------|------|
-| `bin/drdad` | Main Ruby binary (738 lines, self-contained) |
+| `bin/drdad` | Main Ruby binary, self-contained |
+| `bin/gather-reports.sh` | Collects last 7 days of reports for Cowork tasks |
 | `~/.config/launchd/com.drdad.daily.plist` | launchd schedule — 9 AM daily |
 | `~/.config/launchd/drdad-yesterday` | Wrapper: sources shell env, computes yesterday's date |
 | `~/Library/CloudStorage/.../Reports/drdad/` | Central reports directory (ProtonDrive synced) |
@@ -338,6 +339,49 @@ Output:
 - **Individual JSON files**: Each day gets its own file (`2025-03-27.json`), eliminating clobber issues from the previous JSONL approach. Files are pretty-printed for readability and can be individually edited or deleted without affecting other days.
 
 - **Unintegrated refactor**: `lib/drdad/cli.rb` and `lib/drdad/repository.rb` exist as scaffolding for a future `dry-cli` multi-command structure, but aren't used — the binary is entirely self-contained.
+
+## Claude Cowork Integration
+
+drdad reports can be used with [Claude Cowork](https://claude.ai/cowork) scheduled tasks for automated daily check-ins.
+
+### Setup
+
+1. **Reports location**: JSON reports are stored in a ProtonDrive-synced directory:
+   ```
+   ~/Library/CloudStorage/ProtonDrive-.../Individual/Reports/drdad/<repo>/<date>.json
+   ```
+
+2. **Gather script**: `bin/gather-reports.sh` copies the last 7 days of reports into a snapshot directory for Claude to analyze. Symlink it to your Cowork working directory:
+   ```bash
+   ln -s /path/to/drdad/bin/gather-reports.sh /path/to/cowork-task/gather-reports.sh
+   ```
+
+3. **Scheduled task prompt**: Create a `PROMPT.md` in your Cowork task directory:
+   ```markdown
+   Run ./gather-reports.sh, then analyze all JSON files in reports-snapshot/
+   and summarize what I worked on yesterday.
+   ```
+
+### Example Cowork Directory Structure
+
+```
+~/CloudStorage/.../ClaudeCoworker/scheduled/drdad-checkins/
+├── gather-reports.sh -> /path/to/drdad/bin/gather-reports.sh
+├── PROMPT.md
+├── reports-snapshot/
+│   ├── onetimesecret/
+│   │   ├── 2026-03-26.json
+│   │   └── 2026-03-27.json
+│   └── familia/
+│       └── ...
+└── is-it-important-2026-03-27.md  (output)
+```
+
+### Sandbox Considerations
+
+- The Cowork VM sandbox may block destructive operations like `rm -rf`
+- The gather script uses `cp -f` to overwrite existing files instead
+- If the script fails, consider adding a launchd plist to pre-populate `reports-snapshot/` before the scheduled task runs (see `~/.config/launchd/` for existing patterns)
 
 ## License
 

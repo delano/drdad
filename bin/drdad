@@ -18,6 +18,8 @@
 #
 # Options:
 #   -r, --repo PATH      Path to git repository (default: current directory)
+#   -o, --output-dir     Central directory for reports (default: <repo>/.claude/reports)
+#   --also-local         Also write to <repo>/.claude/reports/ (requires --output-dir)
 #   -d, --date DATE      Generate report for specific date (YYYY-MM-DD)
 #   -f, --from DATE      Start date for range (YYYY-MM-DD)
 #   -t, --to DATE        End date for range (YYYY-MM-DD)
@@ -95,14 +97,19 @@ class DevReport
       find_repo_root
     end
     @repo_name = detect_repo_name
+    @local_reports_dir = File.join(@repo_root, '.claude', 'reports')
     @reports_dir = if @options[:output_dir]
       # Central reports directory: <output_dir>/<repo_name>/
       File.join(File.expand_path(@options[:output_dir]), @repo_name)
     else
       # Default: <repo>/.claude/reports/
-      File.join(@repo_root, '.claude', 'reports')
+      @local_reports_dir
     end
     FileUtils.mkdir_p(@reports_dir)
+    # Also write to local repo directory when --also-local is set
+    if @options[:also_local] && @options[:output_dir]
+      FileUtils.mkdir_p(@local_reports_dir)
+    end
   end
 
   def run
@@ -502,8 +509,16 @@ class DevReport
 
   def write_daily_record(record)
     # Write individual JSON file per day (e.g., 2025-03-27.json)
-    daily_file = File.join(@reports_dir, "#{record[:date]}.json")
-    File.write(daily_file, JSON.pretty_generate(stringify_keys(record)))
+    json_content = JSON.pretty_generate(stringify_keys(record))
+    filename = "#{record[:date]}.json"
+
+    # Primary location (--output-dir or local)
+    File.write(File.join(@reports_dir, filename), json_content)
+
+    # Also write to repo-local .claude/reports/ when --also-local is set
+    if @options[:also_local] && @options[:output_dir]
+      File.write(File.join(@local_reports_dir, filename), json_content)
+    end
   end
 
   def stringify_keys(obj)
@@ -733,6 +748,10 @@ OptionParser.new do |opts|
 
   opts.on("-o", "--output-dir PATH", "Central directory for reports (default: <repo>/.claude/reports)") do |o|
     options[:output_dir] = o
+  end
+
+  opts.on("--also-local", "Also write to <repo>/.claude/reports/ (requires --output-dir)") do
+    options[:also_local] = true
   end
 
   opts.on("--throttle MS", Integer, "Delay between AI calls in ms (default: 200)") do |ms|
